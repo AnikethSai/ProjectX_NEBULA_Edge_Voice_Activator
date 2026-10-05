@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nebula — Live Captions</title>
+    <style>
+        :root {
+            /* Light Mode Variables */
+            --bg-color: #f5f5f7;
+            --text-primary: #1d1d1f;
+            --text-secondary: #86868b;
+            --panel-bg: rgba(255, 255, 255, 0.7);
+            --panel-border: rgba(255, 255, 255, 0.5);
+            --accent-color: #007AFF;
+            --shadow-color: rgba(0, 0, 0, 0.08);
+            --danger-color: #ff3b30;
+            --idle-color: #86868b;
+            --font-size-base: 24px;
+        }
+
+        [data-theme="dark"] {
+            /* Dark Mode Variables */
+            --bg-color: #1c1c1e;
+            --text-primary: #f5f5f7;
+            --text-secondary: #98989d;
+            --panel-bg: rgba(44, 44, 46, 0.7);
+            --panel-border: rgba(60, 60, 62, 0.5);
+            --shadow-color: rgba(0, 0, 0, 0.3);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transition: background-color 0.4s ease, color 0.4s ease;
+            overflow: hidden;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 720px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            height: 100%;
+            max-height: 800px;
+            position: relative;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 10px;
+            position: relative;
+        }
+
+        .logo {
+            font-size: 1.2rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
+            opacity: 0.8;
+        }
+
+        .settings-btn {
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: var(--text-primary);
+            opacity: 0.6;
+            transition: opacity 0.2s, transform 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px;
+        }
+
+        .settings-btn:hover {
+            opacity: 1;
+            transform: rotate(15deg);
+        }
+
+        /* Popover */
+        .settings-popover {
+            position: absolute;
+            top: 50px;
+            right: 10px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--panel-border);
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 10px 30px var(--shadow-color);
+            z-index: 100;
+            opacity: 0;
+            transform: scale(0.95) translateY(-10px);
+            pointer-events: none;
+            transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1), transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            min-width: 240px;
+        }
+
+        .settings-popover.active {
+            opacity: 1;
+            transform: scale(1) translateY(0);
+            pointer-events: auto;
+        }
+
+        .setting-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .setting-group label {
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .setting-group input[type="range"] {
+            -webkit-appearance: none;
+            width: 100%;
+            background: transparent;
+        }
+
+        .setting-group input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 20px;
+            width: 20px;
+            border-radius: 50%;
+            background: var(--accent-color);
+            cursor: pointer;
+            margin-top: -8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+
+        .setting-group input[type="range"]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: var(--text-secondary);
+            border-radius: 2px;
+            opacity: 0.3;
+        }
+
+        .toggle-btn {
+            background: none;
+            border: 1px solid var(--text-secondary);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s;
+        }
+        
+        .toggle-btn:hover {
+            background: var(--text-primary);
+            color: var(--bg-color);
+        }
+
+        /* Direct ASR Test Controls */
+        .test-section {
+            border-top: 1px solid rgba(128, 128, 128, 0.15);
+            padding-top: 14px;
+        }
+
+        .test-mic-btn {
+            background: var(--accent-color);
+            color: #ffffff;
+            border: none;
+            padding: 10px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 10px rgba(0, 122, 255, 0.2);
+        }
+
+        .test-mic-btn:hover {
+            opacity: 0.92;
+            transform: translateY(-1px);
+        }
+
+        .test-mic-btn.recording {
+            background: var(--danger-color);
+            animation: record-pulse 1.5s infinite ease-in-out;
+            box-shadow: 0 4px 10px rgba(255, 59, 48, 0.3);
+        }
+
+        @keyframes record-pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.02); }
+            100% { transform: scale(1); }
+        }
+
+        .test-mic-btn.secondary-btn {
+            background: transparent;
+            border: 1px solid var(--text-secondary);
+            color: var(--text-primary);
+            box-shadow: none;
+        }
+
+        .test-mic-btn.secondary-btn:hover {
+            background: rgba(128, 128, 128, 0.12);
+        }
+
+        .test-hint {
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            line-height: 1.3;
+            text-align: center;
+            margin-top: 2px;
+        }
+
+        /* Main Panel */
+        .panel {
+            flex: 1;
+            background: var(--panel-bg);
+            backdrop-filter: blur(24px) saturate(150%);
+            -webkit-backdrop-filter: blur(24px) saturate(150%);
+            border: 1px solid var(--panel-border);
+            border-radius: 24px;
+            box-shadow: 0 20px 40px var(--shadow-color), inset 0 1px 0 rgba(255,255,255,0.2);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* Status Bar */
+        .status-bar {
+            padding: 16px 24px;
+            border-bottom: 1px solid rgba(128, 128, 128, 0.1);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        .indicator {
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 16px;
+            height: 16px;
+        }
+
+        .indicator-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--idle-color);
+        }
+
+        .clear-btn {
+            margin-left: auto;
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: var(--text-secondary);
+            opacity: 0.5;
+            padding: 6px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+
+        .clear-btn:hover {
+            opacity: 1;
+            color: var(--danger-color);
+            background: rgba(255, 59, 48, 0.08);
+            transform: scale(1.05);
+        }
+
+        /* States */
+        .state-disconnected .indicator-dot {
+            background-color: var(--danger-color);
+        }
+
+        .state-esp-offline .indicator-dot {
+            background-color: #ff9f0a;
+            opacity: 0.85;
+            animation: pulse-idle 3s infinite ease-in-out;
+        }
+
+        .state-idle .indicator-dot {
+            background-color: #34c759;
+            animation: pulse-idle 2.5s infinite ease-in-out;
+        }
+
+        @keyframes pulse-idle {
+            0% { transform: scale(1); opacity: 0.8; }
+            50% { transform: scale(1.5); opacity: 0.4; }
+            100% { transform: scale(1); opacity: 0.8; }
+        }
+
+        .waveform {
+            display: none;
+            align-items: center;
+            gap: 2px;
+            height: 12px;
+        }
+
+        .state-receiving .indicator-dot {
+            display: none;
+        }
+        
+        .state-receiving .waveform {
+            display: flex;
+        }
+
+        .waveform-bar {
+            width: 3px;
+            background-color: var(--accent-color);
+            border-radius: 2px;
+            animation: waveform-bounce 1s infinite ease-in-out;
+        }
+
+        .waveform-bar:nth-child(1) { height: 4px; animation-delay: -0.4s; }
+        .waveform-bar:nth-child(2) { height: 12px; animation-delay: -0.2s; }
+        .waveform-bar:nth-child(3) { height: 8px; animation-delay: 0s; }
+
+        @keyframes waveform-bounce {
+            0%, 100% { transform: scaleY(0.4); }
+            50% { transform: scaleY(1); }
+        }
+
+        /* Captions Area */
+        .captions-area {
+            flex: 1;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            scroll-behavior: smooth;
+        }
+
+        /* Hide scrollbar */
+        .captions-area::-webkit-scrollbar {
+            width: 0;
+            background: transparent;
+        }
+
+        .history {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+
+        .caption-line {
+            font-size: var(--font-size-base);
+            line-height: 1.4;
+            color: var(--text-secondary);
+            font-weight: 400;
+            animation: slide-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            transform-origin: left bottom;
+        }
+
+        .active-line {
+            font-size: calc(var(--font-size-base) * 1.1);
+            line-height: 1.4;
+            color: var(--text-primary);
+            font-weight: 500;
+            min-height: 1.4em;
+            transition: all 0.2s ease;
+        }
+
+        @keyframes slide-up {
+            from {
+                opacity: 0;
+                transform: translateY(10px) scale(0.98);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">Nebula</div>
+            <button class="settings-btn" id="settings-toggle" aria-label="Settings">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                </svg>
+            </button>
+            <div class="settings-popover" id="settings-popover">
+                <div class="setting-group">
+                    <label for="font-size-slider">Text Size <span id="font-size-display">24px</span></label>
+                    <input type="range" id="font-size-slider" min="16" max="48" value="24" step="1">
+                </div>
+                <div class="setting-group">
+                    <label for="duration-slider">Stream Duration <span id="duration-display">8s</span></label>
+                    <input type="range" id="duration-slider" min="3" max="30" value="8" step="1">
+                </div>
+                <div class="setting-group">
+                    <button class="toggle-btn" id="theme-toggle">
+                        <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
+                            <circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+                        </svg>
+                        <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+                        </svg>
+                        <span id="theme-text">Toggle Theme</span>
+                    </button>
+                </div>
+                <div class="setting-group test-section">
+                    <label>Test ESP32 Mic (No Wake Word)</label>
+                    <button class="test-mic-btn" id="test-esp-btn">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
+                            <rect x="9" y="9" width="6" height="6"></rect>
+                            <line x1="9" y1="1" x2="9" y2="4"></line>
+                            <line x1="15" y1="1" x2="15" y2="4"></line>
+                            <line x1="9" y1="20" x2="9" y2="23"></line>
+                            <line x1="15" y1="20" x2="15" y2="23"></line>
+                            <line x1="20" y1="9" x2="23" y2="9"></line>
+                            <line x1="20" y1="14" x2="23" y2="14"></line>
+                            <line x1="1" y1="9" x2="4" y2="9"></line>
+                            <line x1="1" y1="14" x2="4" y2="14"></line>
+                        </svg>
+                        <span id="test-esp-label">Stream ESP32 Mic</span>
+                    </button>
+                    <div class="test-hint" id="test-esp-hint">Triggers ESP32 onboard mic to stream</div>
+                </div>
+
+                <div class="setting-group" style="padding-top: 6px;">
+                    <label>Test Laptop Mic (Browser)</label>
+                    <button class="test-mic-btn secondary-btn" id="test-mic-btn">
+                        <svg class="mic-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                            <line x1="12" y1="19" x2="12" y2="23"></line>
+                            <line x1="8" y1="23" x2="16" y2="23"></line>
+                        </svg>
+                        <span id="test-mic-label">Test Laptop Mic</span>
+                    </button>
+                    <div class="test-hint" id="test-hint">Speaks directly through your laptop mic</div>
+                </div>
+            </div>
+        </header>
+
+        <main class="panel">
+            <div class="status-bar state-disconnected" id="status-bar">
+                <div class="indicator">
+                    <div class="indicator-dot"></div>
+                    <div class="waveform">
+                        <div class="waveform-bar"></div>
+                        <div class="waveform-bar"></div>
+                        <div class="waveform-bar"></div>
+                    </div>
+                </div>
+                <span id="status-text">Connecting...</span>
+                <button class="clear-btn" id="clear-btn" title="Clear captions" aria-label="Clear captions">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="3 6 5 6 21 6"></polyline>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    </svg>
+                </button>
+            </div>
+            
+            <div class="captions-area" id="captions-area">
+                <div class="history" id="history">
+                    <!-- Finalized lines will appear here -->
+                </div>
+                <div class="active-line" id="active-line"></div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // DOM Elements
+        const statusBar = document.getElementById('status-bar');
+        const statusText = document.getElementById('status-text');
+        const historyContainer = document.getElementById('history');
+        const activeLineContainer = document.getElementById('active-line');
+        const captionsArea = document.getElementById('captions-area');
+        
+        // Settings Elements
+        const settingsBtn = document.getElementById('settings-toggle');
+        const settingsPopover = document.getElementById('settings-popover');
+        const fontSizeSlider = document.getElementById('font-size-slider');
+        const fontSizeDisplay = document.getElementById('font-size-display');
+        const durationSlider = document.getElementById('duration-slider');
+        const durationDisplay = document.getElementById('duration-display');
+        const themeToggle = document.getElementById('theme-toggle');
+        const iconSun = document.querySelector('.icon-sun');
+        const iconMoon = document.querySelector('.icon-moon');
+        const testEspBtn = document.getElementById('test-esp-btn');
+        const testEspLabel = document.getElementById('test-esp-label');
+        const testEspHint = document.getElementById('test-esp-hint');
+        const testMicBtn = document.getElementById('test-mic-btn');
+        const testMicLabel = document.getElementById('test-mic-label');
+        const testHint = document.getElementById('test-hint');
+        const clearBtn = document.getElementById('clear-btn');
+
+        // State
+        let socket = null;
+        let reconnectDelay = 1000;
+        const maxReconnectDelay = 30000;
+        let isTestingMic = false;
+        let isTestingEsp = false;
+        let espIsOnline = false;
+        let currentStatusState = 'disconnected';
+        let currentStatusSource = null;
+        let testAudioCtx = null;
+        let testMicStream = null;
+        let testProcessor = null;
+        
+        // App settings
+        const appSettings = {
+            fontSize: localStorage.getItem('nebula_font_size') || 24,
+            duration: localStorage.getItem('nebula_stream_duration') || 8,
+            theme: localStorage.getItem('nebula_theme') || 'light'
+        };
+
+        // Initialize Settings
+        function applySettings() {
+            document.documentElement.style.setProperty('--font-size-base', `${appSettings.fontSize}px`);
+            fontSizeSlider.value = appSettings.fontSize;
+            fontSizeDisplay.textContent = `${appSettings.fontSize}px`;
+            
+            durationSlider.value = appSettings.duration;
+            durationDisplay.textContent = `${appSettings.duration}s`;
+            
+            document.documentElement.setAttribute('data-theme', appSettings.theme);
+            if (appSettings.theme === 'dark') {
+                iconSun.style.display = 'block';
+                iconMoon.style.display = 'none';
+                document.getElementById('theme-text').textContent = 'Light Mode';
+            } else {
+                iconSun.style.display = 'none';
+                iconMoon.style.display = 'block';
+                document.getElementById('theme-text').textContent = 'Dark Mode';
+            }
+        }
+
+        applySettings();
+
+        // Event Listeners for Settings
+        settingsBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            settingsPopover.classList.toggle('active');
+        });
+
+        document.addEventListener('click', (e) => {
+            if (!settingsPopover.contains(e.target) && !settingsBtn.contains(e.target)) {
+                settingsPopover.classList.remove('active');
+            }
+        });
+
+        fontSizeSlider.addEventListener('input', (e) => {
+            appSettings.fontSize = e.target.value;
+            applySettings();
+            localStorage.setItem('nebula_font_size', appSettings.fontSize);
+            scrollToBottom();
+        });
+
+        durationSlider.addEventListener('input', (e) => {
+            appSettings.duration = e.target.value;
+            durationDisplay.textContent = `${appSettings.duration}s`;
+            localStorage.setItem('nebula_stream_duration', appSettings.duration);
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({
+                    type: 'set_duration',
+                    duration: parseInt(appSettings.duration)
+                }));
+            }
+        });
+
+        clearBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            historyContainer.innerHTML = '';
+            activeLineContainer.textContent = '';
+        });
+
+        themeToggle.addEventListener('click', () => {
+            appSettings.theme = appSettings.theme === 'light' ? 'dark' : 'light';
+            applySettings();
+            localStorage.setItem('nebula_theme', appSettings.theme);
+        });
+
+        // Downsample audio float buffer to 16kHz 16-bit mono PCM ArrayBuffer
+        function downsampleTo16kPCM(buffer, fromRate) {
+            const toRate = 16000;
+            if (fromRate === toRate) {
+                const pcm = new Int16Array(buffer.length);
+                for (let i = 0; i < buffer.length; i++) {
+                    const s = Math.max(-1, Math.min(1, buffer[i]));
+                    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                return pcm.buffer;
+            }
+            const ratio = fromRate / toRate;
+            const newLength = Math.floor(buffer.length / ratio);
+            const pcm = new Int16Array(newLength);
+            let offsetResult = 0;
+            let offsetBuffer = 0;
+            while (offsetResult < newLength) {
+                const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+                let accum = 0;
+                let count = 0;
+                for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                    accum += buffer[i];
+                    count++;
+                }
+                const s = count > 0 ? (accum / count) : buffer[offsetBuffer];
+                const clamped = Math.max(-1, Math.min(1, s));
+                pcm[offsetResult] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+                offsetResult++;
+                offsetBuffer = nextOffsetBuffer;
+            }
+            return pcm.buffer;
+        }
+
+        async function startMicTest() {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                alert('Backend is disconnected. Please wait for it to connect.');
+                return;
+            }
+            try {
+                testMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                testAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const source = testAudioCtx.createMediaStreamSource(testMicStream);
+                const sampleRate = testAudioCtx.sampleRate;
+                
+                testProcessor = testAudioCtx.createScriptProcessor(4096, 1, 1);
+                
+                // Signal test start to backend
+                socket.send(JSON.stringify({ type: 'test_start' }));
+                
+                isTestingMic = true;
+                testMicBtn.classList.add('recording');
+                testMicLabel.textContent = 'Stop & Transcribe';
+                testHint.textContent = '🔴 Speaking... click when done';
+                
+                testProcessor.onaudioprocess = (e) => {
+                    if (!isTestingMic) return;
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const pcmBuffer = downsampleTo16kPCM(inputData, sampleRate);
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(pcmBuffer);
+                    }
+                };
+
+                source.connect(testProcessor);
+                testProcessor.connect(testAudioCtx.destination);
+            } catch (err) {
+                console.error('Microphone error:', err);
+                alert('Could not access microphone: ' + err.message);
+                stopMicTest();
+            }
+        }
+
+        function stopMicTest() {
+            if (!isTestingMic && !testMicStream) return;
+            isTestingMic = false;
+            testMicBtn.classList.remove('recording');
+            testMicLabel.textContent = 'Test Microphone';
+            testHint.textContent = 'Click to speak directly into your laptop mic';
+
+            if (testProcessor) {
+                testProcessor.disconnect();
+                testProcessor = null;
+            }
+            if (testMicStream) {
+                testMicStream.getTracks().forEach(t => t.stop());
+                testMicStream = null;
+            }
+            if (testAudioCtx) {
+                testAudioCtx.close().catch(() => {});
+                testAudioCtx = null;
+            }
+
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: 'test_stop' }));
+            }
+        }
+
+        testMicBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (isTestingMic) {
+                stopMicTest();
+            } else {
+                startMicTest();
+            }
+        });
+
+        // ESP32 Direct Mic Test Handlers
+        function startEspTest() {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                alert('Backend is disconnected. Please wait for it to connect.');
+                return;
+            }
+            if (isTestingMic) stopMicTest();
+
+            socket.send(JSON.stringify({ type: 'trigger_esp_start' }));
+            isTestingEsp = true;
+            testEspBtn.classList.add('recording');
+            testEspLabel.textContent = 'Stop ESP32 Stream';
+            testEspHint.textContent = '📡 Streaming from ESP32 mic...';
+        }
+
+        function stopEspTest() {
+            if (!isTestingEsp) return;
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: 'trigger_esp_stop' }));
+            }
+            isTestingEsp = false;
+            testEspBtn.classList.remove('recording');
+            testEspLabel.textContent = 'Stream ESP32 Mic';
+            testEspHint.textContent = 'Triggers ESP32 onboard mic to stream';
+        }
+
+        testEspBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (isTestingEsp) {
+                stopEspTest();
+            } else {
+                startEspTest();
+            }
+        });
+
+        window.addEventListener('beforeunload', () => {
+            if (isTestingMic) stopMicTest();
+            if (isTestingEsp) stopEspTest();
+        });
+
+        // UI Updates
+        function renderStatus() {
+            if (currentStatusState === 'disconnected') {
+                statusBar.className = 'status-bar state-disconnected';
+                statusText.textContent = 'Disconnected. Reconnecting...';
+                return;
+            }
+            if (currentStatusState === 'receiving') {
+                statusBar.className = 'status-bar state-receiving';
+                if (currentStatusSource === 'esp32') {
+                    statusText.textContent = 'Transcribing (ESP32 mic)...';
+                } else if (currentStatusSource === 'laptop') {
+                    statusText.textContent = 'Transcribing (Laptop mic)...';
+                } else {
+                    statusText.textContent = 'Transcribing...';
+                }
+                return;
+            }
+            // State is idle
+            if (isTestingEsp) {
+                isTestingEsp = false;
+                testEspBtn.classList.remove('recording');
+                testEspLabel.textContent = 'Stream ESP32 Mic';
+                testEspHint.textContent = 'Triggers ESP32 onboard mic to stream';
+            }
+            if (espIsOnline) {
+                statusBar.className = 'status-bar state-idle';
+                statusText.textContent = 'ESP32 Online — Listening for "nebula"...';
+            } else {
+                statusBar.className = 'status-bar state-esp-offline';
+                statusText.textContent = 'ESP32 Offline (Waiting for device...)';
+            }
+        }
+
+        function setStatus(state, source) {
+            currentStatusState = state;
+            if (source !== undefined) currentStatusSource = source;
+            renderStatus();
+        }
+
+        function updatePartial(text) {
+            activeLineContainer.textContent = text;
+            scrollToBottom();
+        }
+
+        function commitFinal(text) {
+            if (!text.trim()) return;
+            
+            const line = document.createElement('div');
+            line.className = 'caption-line';
+            line.textContent = text;
+            historyContainer.appendChild(line);
+            
+            // Clear partial
+            activeLineContainer.textContent = '';
+            
+            scrollToBottom();
+            
+            // Keep history manageable
+            if (historyContainer.children.length > 50) {
+                historyContainer.removeChild(historyContainer.firstChild);
+            }
+        }
+
+        function scrollToBottom() {
+            captionsArea.scrollTop = captionsArea.scrollHeight;
+        }
+
+        // WebSocket Connection
+        function connect() {
+            setStatus('disconnected');
+            
+            try {
+                const wsHost = window.location.hostname || 'localhost';
+                socket = new WebSocket(`ws://${wsHost}:8765`);
+                
+                socket.onopen = () => {
+                    console.log('Connected to Nebula backend');
+                    reconnectDelay = 1000;
+                    setStatus('idle');
+                    // Sync current duration to backend
+                    socket.send(JSON.stringify({
+                        type: 'set_duration',
+                        duration: parseInt(appSettings.duration)
+                    }));
+                };
+                
+                socket.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        
+                        if (data.type === 'status') {
+                            if (data.esp_online !== undefined) {
+                                espIsOnline = !!data.esp_online;
+                            }
+                            if (data.duration && !localStorage.getItem('nebula_stream_duration')) {
+                                appSettings.duration = data.duration;
+                                durationSlider.value = appSettings.duration;
+                                durationDisplay.textContent = `${appSettings.duration}s`;
+                            }
+                            if (data.state === 'idle' || data.state === 'receiving') {
+                                setStatus(data.state, data.source);
+                            }
+                        } else if (data.type === 'esp_status') {
+                            espIsOnline = !!data.online;
+                            renderStatus();
+                        } else if (data.type === 'partial') {
+                            updatePartial(data.text);
+                            // Implicitly ensure we are showing receiving state if text is coming
+                            if (!statusBar.classList.contains('state-receiving')) {
+                                setStatus('receiving', data.source);
+                            }
+                        } else if (data.type === 'final') {
+                            commitFinal(data.text);
+                            // Only set back to idle if we explicitly receive an idle status
+                        }
+                    } catch (e) {
+                        console.error('Error parsing message:', e);
+                    }
+                };
+                
+                socket.onclose = () => {
+                    console.log(`Disconnected. Reconnecting in ${reconnectDelay}ms...`);
+                    setStatus('disconnected');
+                    activeLineContainer.textContent = '';
+                    if (isTestingMic) stopMicTest();
+                    if (isTestingEsp) stopEspTest();
+                    
+                    setTimeout(connect, reconnectDelay);
+                    // Exponential backoff
+                    reconnectDelay = Math.min(reconnectDelay * 1.5, maxReconnectDelay);
+                };
+                
+                socket.onerror = (err) => {
+                    console.error('WebSocket error:', err);
+                    socket.close();
+                };
+            } catch (e) {
+                console.error('Connection failed:', e);
+                setTimeout(connect, reconnectDelay);
+            }
+        }
+
+        // Start connection
+        connect();
+    </script>
+</body>
+</html>
