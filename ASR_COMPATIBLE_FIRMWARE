@@ -1,0 +1,566 @@
+/* Offline "Nebula" keyword spotter for the XIAO ESP32S3 Sense.
+   Board: XIAO_ESP32S3, ESP32 Arduino core 3.3.12+.
+   The PDM microphone pins are CLK=GPIO42 and DATA=GPIO41. */
+
+#include <Arduino.h>
+#include <driver/i2s_pdm.h>
+#include <esp_heap_caps.h>
+#include <TensorFlowLite_ESP32.h>
+#include "model_data.h"
+#include "tensorflow/lite/experimental/microfrontend/lib/frontend.h"
+#include "tensorflow/lite/experimental/microfrontend/lib/frontend_util.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_allocator.h"
+#include "tensorflow/lite/micro/micro_resource_variable.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+// ===================================================================
+// NEW STREAMING CODE — Wi-Fi & UDP includes
+// ===================================================================
+#include <WiFi.h>
+#include <WiFiUdp.h>
+// ===================================================================
+
+namespace {
+constexpr int kSampleRate = 16000;
+constexpr int kBlockSamples = 320;  // 20 ms.
+constexpr int kBins = 40;
+constexpr int kFrames = 3;
+constexpr int kArenaBytes = 512 * 1024;
+// Matches the exported model manifest: cutoff 0.82, averaged across 3 outputs.
+constexpr float kThreshold = 0.70f;
+constexpr uint32_t kCooldownMs = 3000;
+constexpr uint32_t kBlinkMs = 150;
+// XIAO ESP32-S3 Sense's built-in RGB LED is on GPIO21 and is active LOW.
+// Do not use LED_BUILTIN here: its value depends on the selected board package.
+constexpr int kLedPin = 21;
+constexpr bool kLedActiveLow = true;
+
+// ===================================================================
+// NEW STREAMING CODE — Configuration constants
+// ===================================================================
+// Wi-Fi credentials — change these for your network
+constexpr const char* WIFI_SSID     = "YOUR_SSID_HERE";
+constexpr const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD_HERE";
+
+// Host app UDP endpoint — set to the IP of the machine running the Python backend
+constexpr const char* HOST_IP   = "YOUR_HOST_IP_HERE";
+constexpr uint16_t    HOST_PORT = 12345;
+constexpr uint16_t    ESP_CMD_PORT = 12346;   // UDP port to receive START/STOP commands from host
+constexpr int         kBootBtnPin  = 0;       // XIAO ESP32-S3 BOOT button is GPIO 0 (active LOW)
+
+// Streaming parameters
+uint32_t stream_max_duration_ms            = 8000;   // Configurable max streaming time (default 8s, updated via host)
+constexpr uint32_t SILENCE_TRAILING_MS     = 1800;   // Stop after 1.8s of silence (allows natural pauses)
+constexpr int16_t  SILENCE_THRESHOLD       = 120;    // RMS sensitivity for PDM microphone
+constexpr int      STREAM_FRAME_SAMPLES    = 320;    // 20ms at 16kHz = 320 samples = 640 bytes
+constexpr int      STREAM_PACKET_SIZE      = 4 + (STREAM_FRAME_SAMPLES * 2); // 4-byte seq + PCM payload
+constexpr uint32_t STREAM_LED_PULSE_MS     = 80;     // Fast LED pulse while streaming
+constexpr uint32_t HEARTBEAT_INTERVAL_MS   = 2000;   // Send heartbeat every 2s to report device online
+uint32_t last_heartbeat_ms                 = 0;
+// ===================================================================
+
+i2s_chan_handle_t mic = nullptr;
+FrontendState frontend;
+tflite::AllOpsResolver resolver;
+tflite::MicroErrorReporter error_reporter;
+tflite::MicroAllocator* allocator = nullptr;
+tflite::MicroResourceVariables* resource_variables = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* input = nullptr;
+TfLiteTensor* output = nullptr;
+uint8_t* arena = nullptr;
+int8_t frames[kFrames][kBins];
+int frame_count = 0;
+uint8_t recent_outputs[kFrames] = {0};
+uint8_t output_index = 0;
+uint8_t output_count = 0;
+uint32_t last_detection = UINT32_MAX - kCooldownMs;
+uint32_t last_confidence_report = 0;
+float peak_confidence = 0.0f;
+uint8_t peak_raw_output = 0;
+int32_t loudest_sample = 0;
+int16_t smallest_sample = INT16_MAX;
+int16_t largest_sample = INT16_MIN;
+uint16_t lowest_feature = UINT16_MAX;
+uint16_t highest_feature = 0;
+bool blinking = false, led_on = false;
+uint8_t blink_edges = 0;
+uint32_t last_blink = 0;
+float input_scale = 0.0f;
+int input_zero_point = 0;
+float output_scale = 0.0f;
+int output_zero_point = 0;
+
+// ===================================================================
+// NEW STREAMING CODE — State variables
+// ===================================================================
+WiFiUDP udp;
+bool wifi_connected = false;
+bool streaming = false;            // True while actively streaming audio
+uint32_t stream_seq = 0;           // UDP packet sequence counter
+uint32_t stream_start_ms = 0;      // When current stream began
+uint32_t last_voice_ms = 0;        // Last time audio was above silence threshold
+bool stream_led_state = false;     // For fast LED pulsing during stream
+uint32_t stream_led_toggle_ms = 0; // Last LED toggle time during streaming
+bool detection_pending = false;    // Flag: wake word detected, need to start streaming
+// ===================================================================
+
+void setLed(bool on) {
+  led_on = on;
+  digitalWrite(kLedPin, (on ^ kLedActiveLow) ? HIGH : LOW);
+}
+
+void blinkTwice() {
+  blinking = true;
+  blink_edges = 4;  // on, off, on, off
+  last_blink = millis();
+  setLed(true);
+}
+
+void updateBlink() {
+  if (!blinking || millis() - last_blink < kBlinkMs) return;
+  last_blink = millis();
+  if (--blink_edges == 0) { setLed(false); blinking = false; return; }
+  setLed(!led_on);
+}
+
+bool startFrontend() {
+  FrontendConfig config;
+  FrontendFillConfigWithDefaults(&config);
+  config.window.size_ms = 30;
+  config.window.step_size_ms = 20;
+  config.filterbank.num_channels = kBins;
+  config.filterbank.lower_band_limit = 125.0f;
+  config.filterbank.upper_band_limit = 7500.0f;
+  config.pcan_gain_control.enable_pcan = 1;
+  config.noise_reduction.min_signal_remaining = 0.05f;
+  return FrontendPopulateState(&config, &frontend, kSampleRate) != 0;
+}
+
+bool startInterpreter() {
+  const tflite::Model* model = tflite::GetModel(stream_state_internal_quant_tflite);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.printf("TFLite schema mismatch: model=%d runtime=%d\n", model->version(), TFLITE_SCHEMA_VERSION);
+    return false;
+  }
+  arena = static_cast<uint8_t*>(heap_caps_malloc(kArenaBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (arena == nullptr) {
+    Serial.println("PSRAM tensor arena unavailable; trying internal RAM");
+    arena = static_cast<uint8_t*>(malloc(kArenaBytes));
+  }
+  if (arena == nullptr) {
+    Serial.printf("Cannot allocate %d-byte tensor arena. Enable PSRAM.\n", kArenaBytes);
+    return false;
+  }
+  // This streaming wake-word model has six persistent state variables.
+  // They must be registered before tensor allocation, or VAR_HANDLE fails.
+  allocator = tflite::MicroAllocator::Create(arena, kArenaBytes, &error_reporter);
+  if (allocator == nullptr) return false;
+  resource_variables = tflite::MicroResourceVariables::Create(allocator, 6);
+  if (resource_variables == nullptr) return false;
+  static tflite::MicroInterpreter instance(model, resolver, allocator,
+                                            &error_reporter, resource_variables);
+  interpreter = &instance;
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("AllocateTensors failed; verify that PSRAM is enabled.");
+    return false;
+  }
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+  const bool valid_tensors = input && output && input->type == kTfLiteInt8 &&
+                             output->type == kTfLiteUInt8 && input->bytes == kFrames * kBins &&
+                             output->bytes == 1;
+  if (!valid_tensors) {
+    Serial.println("Unexpected TFLite input/output tensor format");
+    return false;
+  }
+  input_scale = input->params.scale;
+  input_zero_point = input->params.zero_point;
+  output_scale = output->params.scale;
+  output_zero_point = output->params.zero_point;
+  Serial.printf("Model: input int8 [1,%d,%d], scale %.9f, zp %d; output uint8 scale %.9f, zp %d\n",
+                kFrames, kBins, input_scale, input_zero_point,
+                output_scale, output_zero_point);
+  // These are the model's actual values: input 0.101960786/-128 and output
+  // 0.00390625/0. Reading them above keeps this sketch correct if re-quantized.
+  if (input_scale <= 0.0f || output_scale <= 0.0f) {
+    Serial.println("Invalid model quantization parameters");
+    return false;
+  }
+  return valid_tensors;
+}
+
+bool startMicrophone() {
+  const i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+  if (i2s_new_channel(&channel, nullptr, &mic) != ESP_OK) return false;
+  i2s_pdm_rx_config_t config = {
+    .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(kSampleRate),
+    .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {.clk = GPIO_NUM_42, .din = GPIO_NUM_41, .invert_flags = {.clk_inv = false}},
+  };
+  // ESP32-S3 PDM RX has no hardware amplify_num field.  Software gain here
+  // would change the model's calibrated feature distribution, so use the
+  // microphone's native PCM output.
+  return i2s_channel_init_pdm_rx_mode(mic, &config) == ESP_OK && i2s_channel_enable(mic) == ESP_OK;
+}
+
+void processFeature(const uint16_t* values, size_t count) {
+  if (count != kBins) return;
+  int8_t* destination = frames[frame_count];
+  for (int i = 0; i < kBins; ++i) {
+    if (values[i] < lowest_feature) lowest_feature = values[i];
+    if (values[i] > highest_feature) highest_feature = values[i];
+    // Exactly matches the model's Python reference pipeline:
+    // uint16 microfrontend output * 0.0390625, then TFLite int8 quantization.
+    const float feature = values[i] * 0.0390625f;
+    // NumPy's astype(np.int8) in the supplied Python tester truncates toward
+    // zero. Keep this byte-for-byte compatible rather than rounding.
+    const int q = static_cast<int>(feature / input_scale) + input_zero_point;
+    destination[i] = static_cast<int8_t>(constrain(q, -128, 127));
+  }
+  if (++frame_count < kFrames) return;
+  // This streaming model's input dimension of 3 is its inference stride.
+  // Feed consecutive, non-overlapping groups of three features, as the
+  // microWakeWord device runtime does; do not slide/replay two old frames.
+  memcpy(input->data.int8, frames, sizeof(frames));
+  frame_count = 0;
+  if (interpreter->Invoke() != kTfLiteOk) { Serial.println("TFLite invoke failed"); return; }
+  const float confidence = (output->data.uint8[0] - output_zero_point) * output_scale;
+  recent_outputs[output_index] = output->data.uint8[0];
+  output_index = (output_index + 1) % kFrames;
+  if (output_count < kFrames) ++output_count;
+  uint16_t output_sum = 0;
+  for (uint8_t i = 0; i < output_count; ++i) output_sum += recent_outputs[i];
+  // The reference implementation uses 255 as the uint8 probability divisor.
+  const float average_confidence =
+      static_cast<float>(output_sum) / (static_cast<float>(output_count) * 255.0f);
+  const uint32_t now = millis();
+  if (confidence > peak_confidence) {
+    peak_confidence = confidence;
+    peak_raw_output = output->data.uint8[0];
+  }
+  if (now - last_confidence_report >= 3000) {
+    last_confidence_report = now;
+    Serial.printf("Peak confidence (last 3 s): %.3f | raw: %u | mic: %d..%d peak %ld | features: %u..%u\n",
+                  peak_confidence, peak_raw_output, smallest_sample,
+                  largest_sample, loudest_sample, lowest_feature, highest_feature);
+    peak_confidence = 0.0f;
+    peak_raw_output = 0;
+    loudest_sample = 0;
+    smallest_sample = INT16_MAX;
+    largest_sample = INT16_MIN;
+    lowest_feature = UINT16_MAX;
+    highest_feature = 0;
+  }
+  if (output_count == kFrames && average_confidence >= kThreshold &&
+      now - last_detection >= kCooldownMs) {
+    last_detection = now;
+    Serial.printf("Nebula detected (3-output average %.3f; current %.3f)\n",
+                  average_confidence, confidence);
+    blinkTwice();
+
+    // =============================================================
+    // NEW STREAMING CODE — Trigger streaming on detection
+    // =============================================================
+    if (!streaming) {
+      detection_pending = true;
+      Serial.println("[STREAM] Wake word detected — will start streaming");
+    }
+    // =============================================================
+  }
+}
+
+void processAudio(const int16_t* samples, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    if (samples[i] < smallest_sample) smallest_sample = samples[i];
+    if (samples[i] > largest_sample) largest_sample = samples[i];
+    const int32_t magnitude = samples[i] < 0 ? -static_cast<int32_t>(samples[i]) : samples[i];
+    if (magnitude > loudest_sample) loudest_sample = magnitude;
+  }
+  size_t consumed = 0;
+  while (consumed < count) {
+    size_t used = 0;
+    const FrontendOutput feature = FrontendProcessSamples(&frontend, samples + consumed, count - consumed, &used);
+    consumed += used;
+    if (feature.size) processFeature(feature.values, feature.size);
+    if (used == 0 && feature.size == 0) break;
+  }
+}
+
+[[noreturn]] void halt(const char* message) {
+  Serial.println(message);
+  while (true) { setLed(true); delay(100); setLed(false); delay(900); }
+}
+
+// ===================================================================
+// NEW STREAMING CODE — Wi-Fi connection helper
+// ===================================================================
+bool ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_connected = true;
+    return true;
+  }
+
+  Serial.printf("[STREAM] Connecting to Wi-Fi '%s'...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  // Wait up to 5 seconds for connection
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_connected = true;
+    Serial.printf("[STREAM] Wi-Fi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  } else {
+    Serial.println("[STREAM] Wi-Fi connection failed");
+    return false;
+  }
+}
+
+// ===================================================================
+// NEW STREAMING CODE — Compute RMS energy of a block of samples
+// ===================================================================
+int16_t computeRMS(const int16_t* samples, size_t count) {
+  if (count == 0) return 0;
+  uint64_t sum_sq = 0;
+  for (size_t i = 0; i < count; ++i) {
+    int32_t s = samples[i];
+    sum_sq += (uint64_t)(s * s);
+  }
+  return (int16_t)sqrt((double)sum_sq / count);
+}
+
+// ===================================================================
+// NEW STREAMING CODE — Send one UDP packet with sequence header + PCM
+// ===================================================================
+void sendStreamPacket(const int16_t* samples, size_t sample_count) {
+  // Build packet: 4-byte little-endian sequence number + raw PCM bytes
+  uint8_t packet[STREAM_PACKET_SIZE];
+
+  // Sequence number (little-endian uint32)
+  packet[0] = (stream_seq >> 0) & 0xFF;
+  packet[1] = (stream_seq >> 8) & 0xFF;
+  packet[2] = (stream_seq >> 16) & 0xFF;
+  packet[3] = (stream_seq >> 24) & 0xFF;
+
+  // Copy PCM payload
+  size_t pcm_bytes = sample_count * sizeof(int16_t);
+  if (pcm_bytes > sizeof(packet) - 4) pcm_bytes = sizeof(packet) - 4;
+  memcpy(packet + 4, samples, pcm_bytes);
+
+  udp.beginPacket(HOST_IP, HOST_PORT);
+  udp.write(packet, 4 + pcm_bytes);
+  udp.endPacket();
+
+  stream_seq++;
+}
+
+// ===================================================================
+// NEW STREAMING CODE — Send end-of-stream marker (seq header only)
+// ===================================================================
+void sendEndOfStream() {
+  uint8_t packet[4];
+  packet[0] = (stream_seq >> 0) & 0xFF;
+  packet[1] = (stream_seq >> 8) & 0xFF;
+  packet[2] = (stream_seq >> 16) & 0xFF;
+  packet[3] = (stream_seq >> 24) & 0xFF;
+
+  udp.beginPacket(HOST_IP, HOST_PORT);
+  udp.write(packet, 4);
+  udp.endPacket();
+
+  Serial.printf("[STREAM] Sent end-of-stream marker (seq %u)\n", stream_seq);
+}
+
+// ===================================================================
+// NEW STREAMING CODE — Start a streaming session
+// ===================================================================
+void startStreaming() {
+  stream_seq = 0;
+  stream_start_ms = millis();
+  last_voice_ms = millis();  // Assume voice is present at start
+  streaming = true;
+  stream_led_state = true;
+  stream_led_toggle_ms = millis();
+  setLed(true);
+
+  Serial.printf("[STREAM] Streaming started → %s:%d\n", HOST_IP, HOST_PORT);
+}
+
+// ===================================================================
+// NEW STREAMING CODE — Stop streaming and send EOS
+// ===================================================================
+void stopStreaming() {
+  sendEndOfStream();
+  streaming = false;
+  blinking = false;
+  setLed(false);
+
+  Serial.printf("[STREAM] Streaming stopped after %lu ms, %u packets sent\n",
+                millis() - stream_start_ms, stream_seq);
+}
+
+// ===================================================================
+// NEW STREAMING CODE — Update LED pulse pattern while streaming
+// ===================================================================
+void updateStreamLed() {
+  if (!streaming) return;
+  uint32_t now = millis();
+  if (now - stream_led_toggle_ms >= STREAM_LED_PULSE_MS) {
+    stream_led_toggle_ms = now;
+    stream_led_state = !stream_led_state;
+    setLed(stream_led_state);
+  }
+}
+// ===================================================================
+
+}  // namespace
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(kLedPin, OUTPUT);
+  pinMode(kBootBtnPin, INPUT_PULLUP);
+  setLed(false);
+  delay(500);
+  if (!startFrontend()) halt("Microfrontend setup failed");
+  if (!startInterpreter()) halt("TFLite setup failed");
+  if (!startMicrophone()) halt("PDM microphone setup failed");
+  Serial.println("Listening locally for Nebula...");
+
+  // Connect to Wi-Fi at startup so streaming and remote commands are ready immediately
+  if (ensureWiFi()) {
+    udp.begin(ESP_CMD_PORT);
+    Serial.printf("[STREAM] Remote command listener active on UDP port %u\n", ESP_CMD_PORT);
+  }
+}
+
+void loop() {
+  // 1. Check for remote commands from host app (Web UI "Test ESP32 Mic", duration slider, etc.)
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    char cmdBuf[32];
+    int len = udp.read(cmdBuf, sizeof(cmdBuf) - 1);
+    if (len > 0) {
+      cmdBuf[len] = '\0';
+      if (strstr(cmdBuf, "START")) {
+        Serial.println("[CMD] Remote START command from host — streaming ESP32 mic");
+        if (!streaming) {
+          ensureWiFi();
+          startStreaming();
+        }
+      } else if (strstr(cmdBuf, "STOP")) {
+        Serial.println("[CMD] Remote STOP command from host");
+        if (streaming) {
+          stopStreaming();
+        }
+      } else if (strncmp(cmdBuf, "DURATION:", 9) == 0) {
+        int secs = atoi(cmdBuf + 9);
+        if (secs >= 2 && secs <= 60) {
+          stream_max_duration_ms = (uint32_t)secs * 1000;
+          Serial.printf("[CMD] Set max stream duration to %lu ms (%d s)\n",
+                        stream_max_duration_ms, secs);
+        }
+      }
+    }
+  }
+
+  // 2. Check BOOT button (GPIO 0) — physical button trigger to test ESP32 mic directly
+  static bool last_btn_state = HIGH;
+  bool btn_state = digitalRead(kBootBtnPin);
+  if (last_btn_state == HIGH && btn_state == LOW) {
+    if (!streaming) {
+      Serial.println("[BTN] BOOT button pressed -> start streaming ESP32 mic");
+      ensureWiFi();
+      startStreaming();
+    } else {
+      Serial.println("[BTN] BOOT button pressed -> stop streaming");
+      stopStreaming();
+    }
+    delay(50);
+  }
+  last_btn_state = btn_state;
+
+  // 3. Send periodic heartbeat to host so host knows ESP is online and connected
+  uint32_t now_hb = millis();
+  if (wifi_connected && !streaming && (now_hb - last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS)) {
+    last_heartbeat_ms = now_hb;
+    uint8_t hb_packet[4] = {0xFE, 0xFF, 0xFF, 0xFF}; // Magic sequence 0xFFFFFFFE for heartbeat
+    udp.beginPacket(HOST_IP, HOST_PORT);
+    udp.write(hb_packet, sizeof(hb_packet));
+    udp.endPacket();
+  }
+
+  int16_t audio[kBlockSamples];
+  size_t bytes = 0;
+  if (i2s_channel_read(mic, audio, sizeof(audio), &bytes, 50) == ESP_OK && bytes) {
+    const size_t sample_count = bytes / sizeof(audio[0]);
+
+    // ===============================================================
+    // NEW STREAMING CODE — Handle detection → streaming transition
+    // ===============================================================
+    if (detection_pending && !streaming) {
+      detection_pending = false;
+      if (ensureWiFi()) {
+        startStreaming();
+      } else {
+        Serial.println("[STREAM] Skipping stream — no Wi-Fi");
+      }
+    }
+    // ===============================================================
+
+    // Always feed audio to the wake-word detector (even while streaming,
+    // so the model's internal state stays consistent — detections during
+    // streaming are ignored via the cooldown timer).
+    processAudio(audio, sample_count);
+
+    // ===============================================================
+    // NEW STREAMING CODE — Stream audio over UDP
+    // ===============================================================
+    if (streaming) {
+      // Send this 20ms frame over UDP
+      sendStreamPacket(audio, sample_count);
+
+      // Check energy for silence detection
+      int16_t rms = computeRMS(audio, sample_count);
+      if (rms > SILENCE_THRESHOLD) {
+        last_voice_ms = millis();
+      }
+
+      uint32_t now = millis();
+      uint32_t elapsed = now - stream_start_ms;
+
+      // 1.5-second initial grace period: gives user time to start speaking
+      if (elapsed < 1500) {
+        last_voice_ms = now;
+      }
+
+      uint32_t silence_duration = now - last_voice_ms;
+
+      // Stop conditions: configurable max duration or trailing silence
+      if (elapsed >= stream_max_duration_ms) {
+        Serial.printf("[STREAM] Max duration reached (%lu ms)\n", stream_max_duration_ms);
+        stopStreaming();
+      } else if (silence_duration >= SILENCE_TRAILING_MS) {
+        Serial.printf("[STREAM] Silence detected (%lu ms)\n", silence_duration);
+        stopStreaming();
+      }
+
+      // Fast LED pulse while streaming (overrides normal blink)
+      updateStreamLed();
+    }
+    // ===============================================================
+  }
+
+  // Only run normal blink updates when NOT streaming
+  // (streaming has its own LED pattern)
+  if (!streaming) {
+    updateBlink();
+  }
+}
