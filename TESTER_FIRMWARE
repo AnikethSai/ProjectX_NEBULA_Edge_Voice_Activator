@@ -1,0 +1,264 @@
+/* Offline "Nebula" keyword spotter for the XIAO ESP32S3 Sense.
+   Board: XIAO_ESP32S3, ESP32 Arduino core 3.3.12+.
+   The PDM microphone pins are CLK=GPIO42 and DATA=GPIO41. */
+
+#include <Arduino.h>
+#include <driver/i2s_pdm.h>
+#include <esp_heap_caps.h>
+#include <TensorFlowLite_ESP32.h>
+#include "model_data.h"
+#include "tensorflow/lite/experimental/microfrontend/lib/frontend.h"
+#include "tensorflow/lite/experimental/microfrontend/lib/frontend_util.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_allocator.h"
+#include "tensorflow/lite/micro/micro_resource_variable.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+namespace {
+constexpr int kSampleRate = 16000;
+constexpr int kBlockSamples = 320;  // 20 ms.
+constexpr int kBins = 40;
+constexpr int kFrames = 3;
+constexpr int kArenaBytes = 512 * 1024;
+// Matches the exported model manifest: cutoff 0.82, averaged across 3 outputs.
+constexpr float kThreshold = 0.82f;
+constexpr uint32_t kCooldownMs = 3000;
+constexpr uint32_t kBlinkMs = 150;
+// XIAO ESP32-S3 Sense's built-in RGB LED is on GPIO21 and is active LOW.
+// Do not use LED_BUILTIN here: its value depends on the selected board package.
+constexpr int kLedPin = 21;
+constexpr bool kLedActiveLow = true;
+
+i2s_chan_handle_t mic = nullptr;
+FrontendState frontend;
+tflite::AllOpsResolver resolver;
+tflite::MicroErrorReporter error_reporter;
+tflite::MicroAllocator* allocator = nullptr;
+tflite::MicroResourceVariables* resource_variables = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* input = nullptr;
+TfLiteTensor* output = nullptr;
+uint8_t* arena = nullptr;
+int8_t frames[kFrames][kBins];
+int frame_count = 0;
+uint8_t recent_outputs[kFrames] = {0};
+uint8_t output_index = 0;
+uint8_t output_count = 0;
+uint32_t last_detection = UINT32_MAX - kCooldownMs;
+uint32_t last_confidence_report = 0;
+float peak_confidence = 0.0f;
+uint8_t peak_raw_output = 0;
+int32_t loudest_sample = 0;
+int16_t smallest_sample = INT16_MAX;
+int16_t largest_sample = INT16_MIN;
+uint16_t lowest_feature = UINT16_MAX;
+uint16_t highest_feature = 0;
+bool blinking = false, led_on = false;
+uint8_t blink_edges = 0;
+uint32_t last_blink = 0;
+float input_scale = 0.0f;
+int input_zero_point = 0;
+float output_scale = 0.0f;
+int output_zero_point = 0;
+
+void setLed(bool on) {
+  led_on = on;
+  digitalWrite(kLedPin, (on ^ kLedActiveLow) ? HIGH : LOW);
+}
+
+void blinkTwice() {
+  blinking = true;
+  blink_edges = 4;  // on, off, on, off
+  last_blink = millis();
+  setLed(true);
+}
+
+void updateBlink() {
+  if (!blinking || millis() - last_blink < kBlinkMs) return;
+  last_blink = millis();
+  if (--blink_edges == 0) { setLed(false); blinking = false; return; }
+  setLed(!led_on);
+}
+
+bool startFrontend() {
+  FrontendConfig config;
+  FrontendFillConfigWithDefaults(&config);
+  config.window.size_ms = 30;
+  config.window.step_size_ms = 20;
+  config.filterbank.num_channels = kBins;
+  config.filterbank.lower_band_limit = 125.0f;
+  config.filterbank.upper_band_limit = 7500.0f;
+  config.pcan_gain_control.enable_pcan = 1;
+  config.noise_reduction.min_signal_remaining = 0.05f;
+  return FrontendPopulateState(&config, &frontend, kSampleRate) != 0;
+}
+
+bool startInterpreter() {
+  const tflite::Model* model = tflite::GetModel(stream_state_internal_quant_tflite);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.printf("TFLite schema mismatch: model=%d runtime=%d\n", model->version(), TFLITE_SCHEMA_VERSION);
+    return false;
+  }
+  arena = static_cast<uint8_t*>(heap_caps_malloc(kArenaBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (arena == nullptr) {
+    Serial.println("PSRAM tensor arena unavailable; trying internal RAM");
+    arena = static_cast<uint8_t*>(malloc(kArenaBytes));
+  }
+  if (arena == nullptr) {
+    Serial.printf("Cannot allocate %d-byte tensor arena. Enable PSRAM.\n", kArenaBytes);
+    return false;
+  }
+  // This streaming wake-word model has six persistent state variables.
+  // They must be registered before tensor allocation, or VAR_HANDLE fails.
+  allocator = tflite::MicroAllocator::Create(arena, kArenaBytes, &error_reporter);
+  if (allocator == nullptr) return false;
+  resource_variables = tflite::MicroResourceVariables::Create(allocator, 6);
+  if (resource_variables == nullptr) return false;
+  static tflite::MicroInterpreter instance(model, resolver, allocator,
+                                            &error_reporter, resource_variables);
+  interpreter = &instance;
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("AllocateTensors failed; verify that PSRAM is enabled.");
+    return false;
+  }
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+  const bool valid_tensors = input && output && input->type == kTfLiteInt8 &&
+                             output->type == kTfLiteUInt8 && input->bytes == kFrames * kBins &&
+                             output->bytes == 1;
+  if (!valid_tensors) {
+    Serial.println("Unexpected TFLite input/output tensor format");
+    return false;
+  }
+  input_scale = input->params.scale;
+  input_zero_point = input->params.zero_point;
+  output_scale = output->params.scale;
+  output_zero_point = output->params.zero_point;
+  Serial.printf("Model: input int8 [1,%d,%d], scale %.9f, zp %d; output uint8 scale %.9f, zp %d\n",
+                kFrames, kBins, input_scale, input_zero_point,
+                output_scale, output_zero_point);
+  // These are the model's actual values: input 0.101960786/-128 and output
+  // 0.00390625/0. Reading them above keeps this sketch correct if re-quantized.
+  if (input_scale <= 0.0f || output_scale <= 0.0f) {
+    Serial.println("Invalid model quantization parameters");
+    return false;
+  }
+  return valid_tensors;
+}
+
+bool startMicrophone() {
+  const i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+  if (i2s_new_channel(&channel, nullptr, &mic) != ESP_OK) return false;
+  i2s_pdm_rx_config_t config = {
+    .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(kSampleRate),
+    .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {.clk = GPIO_NUM_42, .din = GPIO_NUM_41, .invert_flags = {.clk_inv = false}},
+  };
+  // ESP32-S3 PDM RX has no hardware amplify_num field.  Software gain here
+  // would change the model's calibrated feature distribution, so use the
+  // microphone's native PCM output.
+  return i2s_channel_init_pdm_rx_mode(mic, &config) == ESP_OK && i2s_channel_enable(mic) == ESP_OK;
+}
+
+void processFeature(const uint16_t* values, size_t count) {
+  if (count != kBins) return;
+  int8_t* destination = frames[frame_count];
+  for (int i = 0; i < kBins; ++i) {
+    if (values[i] < lowest_feature) lowest_feature = values[i];
+    if (values[i] > highest_feature) highest_feature = values[i];
+    // Exactly matches the model's Python reference pipeline:
+    // uint16 microfrontend output * 0.0390625, then TFLite int8 quantization.
+    const float feature = values[i] * 0.0390625f;
+    // NumPy's astype(np.int8) in the supplied Python tester truncates toward
+    // zero. Keep this byte-for-byte compatible rather than rounding.
+    const int q = static_cast<int>(feature / input_scale) + input_zero_point;
+    destination[i] = static_cast<int8_t>(constrain(q, -128, 127));
+  }
+  if (++frame_count < kFrames) return;
+  // This streaming model's input dimension of 3 is its inference stride.
+  // Feed consecutive, non-overlapping groups of three features, as the
+  // microWakeWord device runtime does; do not slide/replay two old frames.
+  memcpy(input->data.int8, frames, sizeof(frames));
+  frame_count = 0;
+  if (interpreter->Invoke() != kTfLiteOk) { Serial.println("TFLite invoke failed"); return; }
+  const float confidence = (output->data.uint8[0] - output_zero_point) * output_scale;
+  recent_outputs[output_index] = output->data.uint8[0];
+  output_index = (output_index + 1) % kFrames;
+  if (output_count < kFrames) ++output_count;
+  uint16_t output_sum = 0;
+  for (uint8_t i = 0; i < output_count; ++i) output_sum += recent_outputs[i];
+  // The reference implementation uses 255 as the uint8 probability divisor.
+  const float average_confidence =
+      static_cast<float>(output_sum) / (static_cast<float>(output_count) * 255.0f);
+  const uint32_t now = millis();
+  if (confidence > peak_confidence) {
+    peak_confidence = confidence;
+    peak_raw_output = output->data.uint8[0];
+  }
+  if (now - last_confidence_report >= 3000) {
+    last_confidence_report = now;
+    Serial.printf("Peak confidence (last 3 s): %.3f | raw: %u | mic: %d..%d peak %ld | features: %u..%u\n",
+                  peak_confidence, peak_raw_output, smallest_sample,
+                  largest_sample, loudest_sample, lowest_feature, highest_feature);
+    peak_confidence = 0.0f;
+    peak_raw_output = 0;
+    loudest_sample = 0;
+    smallest_sample = INT16_MAX;
+    largest_sample = INT16_MIN;
+    lowest_feature = UINT16_MAX;
+    highest_feature = 0;
+  }
+  if (output_count == kFrames && average_confidence >= kThreshold &&
+      now - last_detection >= kCooldownMs) {
+    last_detection = now;
+    Serial.printf("Nebula detected (3-output average %.3f; current %.3f)\n",
+                  average_confidence, confidence);
+    blinkTwice();
+  }
+}
+
+void processAudio(const int16_t* samples, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    if (samples[i] < smallest_sample) smallest_sample = samples[i];
+    if (samples[i] > largest_sample) largest_sample = samples[i];
+    const int32_t magnitude = samples[i] < 0 ? -static_cast<int32_t>(samples[i]) : samples[i];
+    if (magnitude > loudest_sample) loudest_sample = magnitude;
+  }
+  size_t consumed = 0;
+  while (consumed < count) {
+    size_t used = 0;
+    const FrontendOutput feature = FrontendProcessSamples(&frontend, samples + consumed, count - consumed, &used);
+    consumed += used;
+    if (feature.size) processFeature(feature.values, feature.size);
+    if (used == 0 && feature.size == 0) break;
+  }
+}
+
+[[noreturn]] void halt(const char* message) {
+  Serial.println(message);
+  while (true) { setLed(true); delay(100); setLed(false); delay(900); }
+}
+}  // namespace
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(kLedPin, OUTPUT);
+  setLed(false);
+  delay(500);
+  if (!startFrontend()) halt("Microfrontend setup failed");
+  if (!startInterpreter()) halt("TFLite setup failed");
+  if (!startMicrophone()) halt("PDM microphone setup failed");
+  Serial.println("Listening locally for Nebula...");
+}
+
+void loop() {
+  int16_t audio[kBlockSamples];
+  size_t bytes = 0;
+  if (i2s_channel_read(mic, audio, sizeof(audio), &bytes, 50) == ESP_OK && bytes) {
+    const size_t sample_count = bytes / sizeof(audio[0]);
+    processAudio(audio, sample_count);
+  }
+  updateBlink();
+}
